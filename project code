@@ -1,0 +1,485 @@
+#<------------Packages Installation------------>
+import os
+import time
+import copy
+import itertools
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from torchvision import datasets, transforms, models
+from PIL import Image
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    roc_curve,
+    auc,
+    precision_recall_fscore_support
+)
+
+# ViT from HuggingFace hub (ImageNet‑21k pretrain, 224x224 patch16) [web:14]
+from transformers import ViTImageProcessor, ViTForImageClassification
+#<-----------------Paths and Datasets---------------->
+base_dir = r"/content/drive/MyDrive/Raji_Project"
+data_dir = os.path.join(base_dir, "data")
+train_dir = os.path.join(data_dir, "train")
+val_dir   = os.path.join(data_dir, "val")
+
+if not os.path.isdir(train_dir) or not os.path.isdir(val_dir):
+    raise FileNotFoundError(
+        f"train/val folders not found under {data_dir}.\n"
+        f"Expected:\n{train_dir}\n{val_dir}"
+    )
+
+# 224x224 transforms (standard for EfficientNet-B3, DenseNet-201, ViT‑base‑224) [web:22][web:27][web:14]
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ]),
+    'val': transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ]),
+}
+
+image_datasets = {
+    x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x])
+    for x in ['train', 'val']
+}
+
+dataloaders = {
+    x: torch.utils.data.DataLoader(
+        image_datasets[x],
+        batch_size=8,
+        shuffle=True if x == 'train' else False,
+        num_workers=0
+    )
+    for x in ['train', 'val']
+}
+
+dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
+class_names = image_datasets['train'].classes
+num_classes = len(class_names)
+
+print("Classes:", class_names)
+print("Train size:", dataset_sizes['train'])
+print("Val size:", dataset_sizes['val'])
+#<-------------Device------------>
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+#<-------------Training Loop------------------->
+def train_model(model, criterion, optimizer, scheduler=None,
+                num_epochs=5, model_name="model", is_vit=False,
+                processor=None):
+    since = time.time()
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": []
+    }
+
+    for epoch in range(num_epochs):
+        epoch_start = time.time()
+        print('-' * 40)
+        print(f"{model_name} - Epoch {epoch+1}/{num_epochs}")
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    if is_vit:
+                        pil_batch = [transforms.ToPILImage()(img.cpu())
+                                     for img in inputs]
+                        vit_inputs = processor(
+                            images=pil_batch, return_tensors="pt"
+                        )
+                        vit_inputs = {k: v.to(device) for k, v in vit_inputs.items()}
+                        outputs = model(**vit_inputs)
+                        logits = outputs.logits
+                    else:
+                        logits = model(inputs)
+
+                    _, preds = torch.max(logits, 1)
+                    loss = criterion(logits, labels)
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            if phase == 'train' and scheduler is not None:
+                scheduler.step()
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double().item() / dataset_sizes[phase]
+
+            print(f"{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
+
+            if phase == 'train':
+                history["train_loss"].append(epoch_loss)
+                history["train_acc"].append(epoch_acc)
+            else:
+                history["val_loss"].append(epoch_loss)
+                history["val_acc"].append(epoch_acc)
+
+            if phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model_wts = copy.deepcopy(model.state_dict())
+
+        epoch_time = time.time() - epoch_start
+        print(f"{model_name} Epoch {epoch+1} time: {epoch_time:.1f} sec")
+
+    time_elapsed = time.time() - since
+    print('-' * 40)
+    print(f"{model_name} training complete in {time_elapsed:.1f} sec "
+          f"({time_elapsed/60.0:.1f} min)")
+    print(f"{model_name} Best val Acc: {best_acc:.4f}")
+
+    model.load_state_dict(best_model_wts)
+    return model, history
+#<-------------------------Metrics and Plots------------------------->
+def plot_curves(history, model_name="model"):
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    plt.figure()
+    plt.plot(epochs, history["train_loss"], label="Train loss")
+    plt.plot(epochs, history["val_loss"], label="Val loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"{model_name} - Loss over epochs")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(epochs, history["train_acc"], label="Train acc")
+    plt.plot(epochs, history["val_acc"], label="Val acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title(f"{model_name} - Accuracy over epochs")
+    plt.legend()
+    plt.show()
+
+
+def evaluate_with_metrics(model, model_name="model", is_vit=False, processor=None):
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloaders['val']:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            if is_vit:
+                pil_batch = [transforms.ToPILImage()(img.cpu()) for img in inputs]
+                vit_inputs = processor(images=pil_batch, return_tensors="pt")
+                vit_inputs = {k: v.to(device) for k, v in vit_inputs.items()}
+                outputs = model(**vit_inputs)
+                logits = outputs.logits
+            else:
+                logits = model(inputs)
+
+            probs = torch.softmax(logits, dim=1)
+            _, preds = torch.max(probs, 1)
+
+            all_labels.extend(labels.cpu().numpy().tolist())
+            all_preds.extend(preds.cpu().numpy().tolist())
+            all_probs.extend(probs[:, 1].cpu().numpy().tolist())
+
+    all_labels_tensor = torch.tensor(all_labels)
+    all_preds_tensor = torch.tensor(all_preds)
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels_tensor, all_preds_tensor, average="binary", pos_label=1
+    )
+
+    acc = (all_preds_tensor == all_labels_tensor).float().mean().item()
+
+    print(f"\n===== {model_name} METRICS =====")
+    print(f"Accuracy : {acc*100:.2f}%")
+    print(f"Precision: {precision*100:.2f}%")
+    print(f"Recall   : {recall*100:.2f}%")
+    print(f"F1-score : {f1*100:.2f}%")
+
+    cm = confusion_matrix(all_labels, all_preds)
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    plt.figure()
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title(f"{model_name} - Confusion Matrix")
+    plt.colorbar()
+    tick_marks = range(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+
+    thresh = cm.max() / 2.0
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], 'd'),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.show()
+
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)
+    roc_auc = auc(fpr, tpr)
+    print(f"{model_name} ROC AUC: {roc_auc:.4f}")
+
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange',
+             lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f"{model_name} - ROC Curve")
+    plt.legend(loc="lower right")
+    plt.show()
+
+    print("\nClassification report:")
+    print(classification_report(all_labels, all_preds, target_names=class_names))
+
+    return acc, precision, recall, f1, roc_auc
+#<----------------Model Builders------------------>
+def build_efficientnet_b3(num_classes, pretrained=True):
+    from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights  # [web:22]
+    if pretrained:
+        weights = EfficientNet_B3_Weights.IMAGENET1K_V1
+        model = efficientnet_b3(weights=weights)
+    else:
+        model = efficientnet_b3(weights=None)
+
+    in_features = model.classifier[1].in_features
+    model.classifier[1] = nn.Linear(in_features, num_classes)
+    return model
+
+
+def build_densenet201(num_classes, pretrained=True):
+    from torchvision.models import densenet201, DenseNet201_Weights  # [web:27]
+    if pretrained:
+        weights = DenseNet201_Weights.IMAGENET1K_V1
+        model = densenet201(weights=weights)
+    else:
+        model = densenet201(weights=None)
+
+    in_features = model.classifier.in_features
+    model.classifier = nn.Linear(in_features, num_classes)
+    return model
+
+
+def build_vit_base_patch16(num_classes, pretrained=True):
+    if pretrained:
+        model = ViTForImageClassification.from_pretrained(
+            "google/vit-base-patch16-224"
+        )
+        processor = ViTImageProcessor.from_pretrained(
+            "google/vit-base-patch16-224"
+        )
+    else:
+        model = ViTForImageClassification.from_pretrained(
+            "google/vit-base-patch16-224",
+            ignore_mismatched_sizes=True
+        )
+        processor = ViTImageProcessor.from_pretrained(
+            "google/vit-base-patch16-224"
+        )
+
+    in_features = model.classifier.in_features
+    model.classifier = nn.Linear(in_features, num_classes)
+
+    return model, processor
+#<-------------------Save/Load helpers---------------------->
+def save_model(model, path):
+    torch.save(model.state_dict(), path)
+    print("Model saved to:", path)
+
+
+def load_torchvision_model(build_fn, num_classes, path):
+    model = build_fn(num_classes=num_classes, pretrained=False)
+    model.load_state_dict(torch.load(path, map_location=device))
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def load_vit_model(num_classes, path):
+    model, processor = build_vit_base_patch16(num_classes=num_classes, pretrained=False)
+    model.load_state_dict(torch.load(path, map_location=device))
+    model = model.to(device)
+    model.eval()
+    return model, processor
+#<-------------Single Image Prediction-------------->
+def predict_single_image(image_path, model, transform, model_name="model",
+                         is_vit=False, processor=None):
+    img = Image.open(image_path).convert("RGB")
+    if is_vit:
+        vit_inputs = processor(images=[img], return_tensors="pt")
+        vit_inputs = {k: v.to(device) for k, v in vit_inputs.items()}
+        with torch.no_grad():
+            outputs = model(**vit_inputs)
+            logits = outputs.logits
+    else:
+        inp = transform(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = model(inp)
+
+    probs = torch.softmax(logits, dim=1)
+    _, pred = torch.max(probs, 1)
+    pred_class = class_names[pred.item()]
+
+    print(f"\n[{model_name}] Image: {image_path}")
+    print("Predicted class label:", pred_class)
+
+    if pred_class == "all":
+        print("Decision: CANCER (ALL) detected for this image.")
+    elif pred_class == "hem":
+        print("Decision: HEALTHY (no cancer) for this image.")
+    else:
+        print("Decision: belongs to class:", pred_class)
+
+    return pred_class
+#<--------------Main Training for Three Models-------------->
+if __name__ == "__main__":
+    num_epochs = 15          # increase to 10–20 for better accuracy
+    opt_choice = "adam"     # "adam" or "adagrad"
+
+    # -------- EfficientNet-B3 --------
+    eff_model = build_efficientnet_b3(num_classes=num_classes, pretrained=True)
+    eff_model = eff_model.to(device)
+    criterion = nn.CrossEntropyLoss()
+
+    if opt_choice.lower() == "adam":
+        eff_optimizer = optim.Adam(eff_model.parameters(), lr=1e-4, weight_decay=1e-4)
+    else:
+        eff_optimizer = optim.Adagrad(eff_model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    eff_scheduler = lr_scheduler.StepLR(eff_optimizer, step_size=5, gamma=0.1)
+
+    eff_model, eff_history = train_model(
+        eff_model, criterion, eff_optimizer, scheduler=eff_scheduler,
+        num_epochs=num_epochs, model_name="EfficientNet-B3", is_vit=False
+    )
+    plot_curves(eff_history, model_name="EfficientNet-B3")
+    eff_acc, eff_p, eff_r, eff_f1, eff_auc = evaluate_with_metrics(
+        eff_model, model_name="EfficientNet-B3", is_vit=False
+    )
+    eff_path = os.path.join(base_dir, "efficientnet_b3_blood_cancer.pth")
+    save_model(eff_model, eff_path)
+
+    # -------- DenseNet-201 --------
+    den_model = build_densenet201(num_classes=num_classes, pretrained=True)
+    den_model = den_model.to(device)
+
+    if opt_choice.lower() == "adam":
+        den_optimizer = optim.Adam(den_model.parameters(), lr=1e-4, weight_decay=1e-4)
+    else:
+        den_optimizer = optim.Adagrad(den_model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    den_scheduler = lr_scheduler.StepLR(den_optimizer, step_size=5, gamma=0.1)
+
+    den_model, den_history = train_model(
+        den_model, criterion, den_optimizer, scheduler=den_scheduler,
+        num_epochs=num_epochs, model_name="DenseNet-201", is_vit=False
+    )
+    plot_curves(den_history, model_name="DenseNet-201")
+    den_acc, den_p, den_r, den_f1, den_auc = evaluate_with_metrics(
+        den_model, model_name="DenseNet-201", is_vit=False
+    )
+    den_path = os.path.join(base_dir, "densenet201_blood_cancer.pth")
+    save_model(den_model, den_path)
+
+    # -------- ViT-Base Patch16 224 --------
+    vit_model, vit_processor = build_vit_base_patch16(
+        num_classes=num_classes, pretrained=True
+    )
+    vit_model = vit_model.to(device)
+
+    if opt_choice.lower() == "adam":
+        vit_optimizer = optim.Adam(vit_model.parameters(), lr=1e-5, weight_decay=1e-4)
+    else:
+        vit_optimizer = optim.Adagrad(vit_model.parameters(), lr=5e-5, weight_decay=1e-4)
+
+    vit_scheduler = lr_scheduler.StepLR(vit_optimizer, step_size=5, gamma=0.1)
+
+    vit_model, vit_history = train_model(
+        vit_model, criterion, vit_optimizer, scheduler=vit_scheduler,
+        num_epochs=num_epochs, model_name="ViT-Base-Patch16", is_vit=True,
+        processor=vit_processor
+    )
+    plot_curves(vit_history, model_name="ViT-Base-Patch16")
+    vit_acc, vit_p, vit_r, vit_f1, vit_auc = evaluate_with_metrics(
+        vit_model, model_name="ViT-Base-Patch16", is_vit=True,
+        processor=vit_processor
+    )
+    vit_path = os.path.join(base_dir, "vit_base_patch16_blood_cancer.pth")
+    save_model(vit_model, vit_path)
+
+    # -------- Summary --------
+    print("\n================ SUMMARY (VAL SET) ================")
+    print(f"EfficientNet-B3:  Acc={eff_acc*100:.2f}  P={eff_p*100:.2f}  "
+          f"R={eff_r*100:.2f}  F1={eff_f1*100:.2f}  AUC={eff_auc:.4f}")
+    print(f"DenseNet-201   :  Acc={den_acc*100:.2f}  P={den_p*100:.2f}  "
+          f"R={den_r*100:.2f}  F1={den_f1*100:.2f}  AUC={den_auc:.4f}")
+    print(f"ViT-Base-P16   :  Acc={vit_acc*100:.2f}  P={vit_p*100:.2f}  "
+          f"R={vit_r*100:.2f}  F1={vit_f1*100:.2f}  AUC={vit_auc:.4f}")
+#<--------------Example Predictions-------------->
+    example_cls = class_names[0]
+    example_folder = os.path.join(val_dir, example_cls)
+    example_files = [f for f in os.listdir(example_folder)
+                     if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))]
+
+    if len(example_files) > 0:
+        example_image = os.path.join(example_folder, example_files[0])
+        print("\nRunning test prediction with ViT on:", example_image)
+        predict_single_image(
+            example_image, vit_model, data_transforms['val'],
+            model_name="ViT-Base-Patch16", is_vit=True,
+            processor=vit_processor
+        )
+    else:
+        print(f"No images found in {example_folder} for test prediction.")
+
+    specific_image_path = os.path.join(base_dir, "test_images", "cancer_1.png")
+    if os.path.isfile(specific_image_path):
+        print("\nRunning prediction on specific image with ViT:", specific_image_path)
+        predict_single_image(
+            specific_image_path, vit_model, data_transforms['val'],
+            model_name="ViT-Base-Patch16", is_vit=True,
+            processor=vit_processor
+        )
+    else:
+        print("Specific image not found (update path):", specific_image_path)
